@@ -1,0 +1,564 @@
+"""Employee Attendance & Productivity Analyzer.
+
+Supports CSV by default and XLSX when pandas + openpyxl are installed.
+Run: python main.py --input data/attendance_sample.csv --output-dir output
+"""
+from __future__ import annotations
+
+import argparse
+import csv
+import json  # Serializes report data before it is embedded in the HTML template.
+import logging
+import sys
+import webbrowser  # Opens the optional interactive report produced by the CLI.
+from collections import defaultdict
+from dataclasses import dataclass
+from datetime import date, datetime, time
+from pathlib import Path
+from typing import Any
+
+# These constants define the accepted input format and the default business rule.
+# Python fundamentals: constants keep accepted values and defaults in one reusable place.
+REQUIRED_COLUMNS = {"employee_id", "name", "date", "status"}
+VALID_STATUSES = {"PRESENT", "ABSENT", "LATE", "HALF-DAY", "LEAVE"}
+DEFAULT_LOW_HOURS = 8.0
+OVERTIME_HOURS_THRESHOLD = 8.0
+TIME_FORMATS = ("%H:%M", "%H:%M:%S")
+
+
+# Python fundamentals: a dataclass groups the fields for one validated attendance row.
+@dataclass
+class AttendanceRecord:
+    """One validated row, stored with dates, times, and hours in usable types."""
+
+    employee_id: str
+    name: str
+    work_date: date
+    status: str
+    department: str
+    hours_worked: float
+    login_time: time | None
+    logout_time: time | None
+    source_row: int
+
+
+def configure_logging(output_dir: Path) -> logging.Logger:
+    """Create a file and console logger for the run."""
+    # Deliverable: show progress in the console and save the same messages to application.log.
+    # Logging: send progress and problems to both the user and the saved application log.
+    output_dir.mkdir(parents=True, exist_ok=True)
+    logger = logging.getLogger("attendance_analyzer")
+    logger.setLevel(logging.INFO)
+    # Close old file handlers before replacing them. This matters on Windows,
+    # where an open log file prevents temporary output directories from being
+    # removed after a run or test.
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
+    formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(message)s")
+    file_handler = logging.FileHandler(output_dir / "application.log", mode="w", encoding="utf-8")
+    file_handler.setFormatter(formatter)
+    console_handler = logging.StreamHandler(sys.stdout)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    logger.addHandler(console_handler)
+    return logger
+
+
+def parse_date(value: str) -> date:
+    """Parse common ISO and day/month/year date formats."""
+    # datetime: convert text to date objects so invalid dates are rejected and valid dates can be compared.
+    # Trim spreadsheet whitespace, then try only the date formats documented for this input.
+    value = (value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%m/%d/%Y"):
+        try:
+            return datetime.strptime(value, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError("date must use YYYY-MM-DD, DD/MM/YYYY, or MM/DD/YYYY")
+
+
+def parse_time(value: str) -> time | None:
+    """Parse a time value; blank values return None."""
+    # datetime: parse clock text into time objects for shift validation and hour calculations.
+    # Blank times are allowed when the row provides hours_worked directly.
+    value = (value or "").strip()
+    if not value:
+        return None
+    for fmt in TIME_FORMATS:
+        try:
+            return datetime.strptime(value, fmt).time()
+        except ValueError:
+            continue
+    raise ValueError("time must use HH:MM or HH:MM:SS")
+
+
+def parse_nonnegative_float(value: str, field_name: str) -> float | None:
+    """Parse an optional non-negative number, rejecting invalid numeric values."""
+    # Exception handling: turn invalid numeric input into a clear field-specific validation error.
+    # Keep blank values distinguishable from zero; reject negative and non-finite hours.
+    value = (value or "").strip()
+    if not value:
+        return None
+    try:
+        number = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be numeric") from exc
+    if number < 0:
+        raise ValueError(f"{field_name} cannot be negative")
+    if number != number or number in (float("inf"), float("-inf")):
+        raise ValueError(f"{field_name} must be finite")
+    return number
+
+
+def read_input(path: Path) -> list[dict[str, str]]:
+    """Read CSV or XLSX rows into dictionaries, with clear file/format errors."""
+    # Deliverable: accept CSV input and optional XLSX input.
+    # File handling: open the selected input path and return its records for the validation stage.
+    # Lists/dictionaries: store the file as a list of rows, with each row's column names as dictionary keys.
+    if not path.exists():
+        raise FileNotFoundError(f"Input file not found: {path}")
+    # Lowercase the extension so input type selection works for .CSV and .XLSX too.
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        # File handling: the with-block closes the CSV input file even if parsing fails.
+        # DictReader maps each CSV row by its column names; utf-8-sig also
+        # handles files saved with a spreadsheet-generated byte-order mark.
+        with path.open("r", newline="", encoding="utf-8-sig") as handle:
+            reader = csv.DictReader(handle)
+            if reader.fieldnames is None:
+                raise ValueError("Input CSV is empty or has no header row")
+            # Comprehension: normalize every header in one pass to make column checks consistent.
+            # Normalize column labels once so capitalization and surrounding spaces do not matter.
+            normalized = [str(c).strip().lower() for c in reader.fieldnames]
+            if len(normalized) != len(set(normalized)):
+                raise ValueError("Input contains duplicate column names after normalization")
+            rows = []
+            for raw in reader:
+                # Ignore extra unnamed CSV cells and treat empty cells as blank strings.
+                rows.append({str(k).strip().lower(): (v or "").strip()
+                             for k, v in raw.items() if k is not None})
+            return rows
+    if suffix in {".xlsx", ".xls"}:
+        try:
+            # Pandas: read Excel worksheets as rows so they enter the same processing pipeline as CSV data.
+            # pandas is imported only for Excel files, so CSV users need no
+            # third-party packages.
+            import pandas as pd
+        except ImportError as exc:
+            raise RuntimeError("Reading Excel requires pandas and openpyxl. Install with: pip install pandas openpyxl") from exc
+        frame = pd.read_excel(path, dtype=str).fillna("")
+        # Apply the same column-name normalization as the CSV path.
+        frame.columns = [str(c).strip().lower() for c in frame.columns]
+        if frame.columns.duplicated().any():
+            raise ValueError("Input contains duplicate column names after normalization")
+        # Comprehension: convert spreadsheet rows into the same list-of-dictionaries structure used for CSV.
+        return [{str(k): str(v).strip() for k, v in row.items()} for row in frame.to_dict(orient="records")]
+    raise ValueError("Unsupported input format. Use .csv or .xlsx")
+
+
+def validate_and_clean(rows: list[dict[str, str]], logger: logging.Logger
+                       ) -> tuple[list[AttendanceRecord], list[dict[str, str]]]:
+    """Validate schema and rows; return accepted records and rejected rows with reasons."""
+    # Functional requirement 1: validate input fields and separate rejected rows from cleaned records.
+    # Lists/dictionaries: keep accepted records and rejection details in separate collections for later reports.
+    if not rows:
+        raise ValueError("Input contains a header but no data rows")
+    columns = set(rows[0])
+    missing_columns = REQUIRED_COLUMNS - columns
+    if missing_columns:
+        raise ValueError("Missing required columns: " + ", ".join(sorted(missing_columns)))
+
+    accepted: list[AttendanceRecord] = []
+    rejected: list[dict[str, str]] = []
+    # Case-fold IDs so E1 and e1 are treated as the same employee for duplicates.
+    seen_keys: set[tuple[str, date]] = set()
+
+    # CSV row numbers start at 2 because row 1 contains the column headings.
+    for row_number, row in enumerate(rows, start=2):
+        # Python fundamentals: process each row independently so one bad record does not stop the whole file.
+        errors: list[str] = []
+        # Normalize each field before validation so comparisons use a consistent form.
+        employee_id = (row.get("employee_id") or "").strip()
+        name = (row.get("name") or "").strip()
+        raw_date = row.get("date", "")
+        # Uppercase statuses for comparisons and accept Half_Day as Half-Day.
+        status = (row.get("status") or "").strip().upper().replace("_", "-")
+        department = (row.get("department") or "").strip() or "Unspecified"
+        work_date: date | None = None
+        login: time | None = None
+        logout: time | None = None
+        hours: float | None = None
+
+        # Collect all basic field problems together so one rejection lists every issue on that row.
+        if not employee_id:
+            errors.append("employee_id is required")
+        if not name:
+            errors.append("name is required")
+        try:
+            work_date = parse_date(raw_date)
+        except ValueError as exc:
+            # Exception handling: save the parse problem on this row and continue checking its other fields.
+            errors.append(str(exc))
+        if status not in VALID_STATUSES:
+            errors.append("status must be one of: " + ", ".join(sorted(VALID_STATUSES)))
+
+        try:
+            hours = parse_nonnegative_float(row.get("hours_worked", ""), "hours_worked")
+        except ValueError as exc:
+            errors.append(str(exc))
+        try:
+            login = parse_time(row.get("login_time", ""))
+        except ValueError as exc:
+            errors.append("login_time: " + str(exc))
+        try:
+            logout = parse_time(row.get("logout_time", ""))
+        except ValueError as exc:
+            errors.append("logout_time: " + str(exc))
+
+        if hours is not None and (login is not None or logout is not None):
+            # Explicit hours take precedence, but a partially supplied time
+            # pair is still an input error.
+            # Exception handling: invalid or incomplete values are collected as row validation errors.
+            if (login is None) != (logout is None):
+                errors.append("login_time and logout_time must both be provided")
+        elif hours is None:
+            # Attended statuses must include either explicit hours or a complete, forward-moving time pair.
+            if status in {"PRESENT", "LATE", "HALF-DAY"}:
+                if login is None or logout is None:
+                    errors.append("provide hours_worked or both login_time and logout_time for attended days")
+                elif logout <= login:
+                    errors.append("logout_time must be later than login_time; overnight shifts are not supported")
+            elif (login is None) != (logout is None):
+                errors.append("login_time and logout_time must both be provided")
+            elif status in {"ABSENT", "LEAVE"} and login is not None and logout is not None and logout <= login:
+                errors.append("logout_time must be later than login_time; overnight shifts are not supported")
+
+        # More than 24 hours cannot fit into a supported single-day shift.
+        if hours is not None and hours > 24:
+            errors.append("hours_worked cannot exceed 24")
+
+        if errors:
+            # Exception handling: collect and log row validation failures, then skip only this rejected record.
+            # Keep bad rows out of all calculations, but explain each rejection
+            # in both the output CSV and application log.
+            rejected.append({
+                "source_row": str(row_number),
+                "employee_id": employee_id,
+                "name": name,
+                "date": raw_date,
+                "status": status,
+                "rejection_reasons": "; ".join(errors),
+            })
+            logger.warning("Rejected source row %s: %s", row_number, "; ".join(errors))
+            continue
+
+        assert work_date is not None
+        key = (employee_id.casefold(), work_date)
+        if hours is None:
+            # If hours were not entered, derive them from the same-day time pair.
+            if login is not None and logout is not None:
+                # datetime arithmetic: combine the work date and clock values to calculate elapsed hours.
+                start_dt = datetime.combine(work_date, login)
+                end_dt = datetime.combine(work_date, logout)
+                hours = (end_dt - start_dt).total_seconds() / 3600
+            else:
+                hours = 0.0
+        if status in {"LEAVE", "ABSENT"} and hours > 0:
+            # An absent or on-leave employee cannot also have worked positive hours.
+            errors.append(f"{status} records cannot have positive working hours")
+        if errors:
+            rejected.append({
+                "source_row": str(row_number),
+                "employee_id": employee_id,
+                "name": name,
+                "date": raw_date,
+                "status": status,
+                "rejection_reasons": "; ".join(errors),
+            })
+            logger.warning("Rejected source row %s: %s", row_number, "; ".join(errors))
+            continue
+
+        if key in seen_keys:
+            # Reject repeat dates so an employee's attendance cannot be counted twice.
+            rejected.append({
+                "source_row": str(row_number),
+                "employee_id": employee_id,
+                "name": name,
+                "date": raw_date,
+                "status": status,
+                "rejection_reasons": "duplicate employee_id and date",
+            })
+            logger.warning("Rejected duplicate employee/date at source row %s", row_number)
+            continue
+
+        # Reserve the employee/date only after the entire row is accepted. A
+        # malformed row must not cause a later valid row to look like a duplicate.
+        seen_keys.add(key)
+
+        accepted.append(AttendanceRecord(employee_id, name, work_date, status,
+                                         department, float(hours), login, logout, row_number))
+    return accepted, rejected
+
+
+def attendance_credit(status: str) -> float:
+    """Convert a status into attendance credit: full, half, or zero days."""
+    # Full credit applies to Present/Late, half credit to Half-Day, and no credit otherwise.
+    if status in {"PRESENT", "LATE"}:
+        return 1.0
+    if status == "HALF-DAY":
+        return 0.5
+    return 0.0
+
+
+def calculate_metrics(records: list[AttendanceRecord], low_hours_threshold: float = DEFAULT_LOW_HOURS
+                     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Calculate employee metrics and row-level attendance exceptions."""
+    # Functional requirement 2: calculate attendance percentages and total working hours.
+    # Group rows first so each employee gets one summary, even with many dates.
+    # Lists/dictionaries: group each employee ID with that employee's daily records before calculating totals.
+    grouped: dict[str, list[AttendanceRecord]] = defaultdict(list)
+    for record in records:
+        grouped[record.employee_id].append(record)
+
+    summaries: list[dict[str, Any]] = []
+    exceptions: list[dict[str, Any]] = []
+    for employee_id, employee_records in sorted(grouped.items()):
+        # Sorting makes the last accepted date the source of the displayed name and department.
+        employee_records.sort(key=lambda r: r.work_date)
+        name = employee_records[-1].name
+        department = employee_records[-1].department
+
+        # Approved leave is assumed to be excused, so it is left out of the
+        # attendance percentage denominator.
+        eligible_days = sum(1 for r in employee_records if r.status != "LEAVE")
+        # Sum fractional day credits before dividing by eligible scheduled records.
+        attended_credit = sum(attendance_credit(r.status) for r in employee_records)
+        percentage = (attended_credit / eligible_days * 100) if eligible_days else 0.0
+        total_hours = sum(r.hours_worked for r in employee_records)
+        absent_days = sum(r.status == "ABSENT" for r in employee_records)
+        late_days = sum(r.status == "LATE" for r in employee_records)
+        half_days = sum(r.status == "HALF-DAY" for r in employee_records)
+
+        summaries.append({
+            "employee_id": employee_id,
+            "name": name,
+            "department": department,
+            "records_count": len(employee_records),
+            "eligible_days": eligible_days,
+            "attended_day_equivalent": round(attended_credit, 2),
+            "attendance_percentage": round(percentage, 2),
+            "total_working_hours": round(total_hours, 2),
+            "absent_days": absent_days,
+            "late_days": late_days,
+            "half_days": half_days,
+        })
+
+        for r in employee_records:
+            # Functional requirement 3: identify absent, late, and below-threshold attendance records.
+            # An exception row can include more than one reason, such as a late
+            # arrival that also resulted in fewer than the expected hours.
+            # One exception row can report multiple reasons, such as late arrival and low working hours.
+            reasons = []
+            if r.status == "ABSENT":
+                reasons.append("Absent")
+            if r.status == "LATE":
+                reasons.append("Late")
+            if r.status in {"PRESENT", "LATE", "HALF-DAY"} and r.hours_worked < low_hours_threshold:
+                reasons.append(f"Low hours ({r.hours_worked:.2f} < {low_hours_threshold:.2f})")
+            if reasons:
+                exceptions.append({
+                    "employee_id": r.employee_id,
+                    "name": r.name,
+                    "department": r.department,
+                    "date": r.work_date.isoformat(),
+                    "status": r.status,
+                    "hours_worked": round(r.hours_worked, 2),
+                    "exception": "; ".join(reasons),
+                })
+    return summaries, exceptions
+
+
+def write_csv(path: Path, rows: list[dict[str, Any]], fieldnames: list[str]) -> None:
+    """Write rows to CSV and preserve headers for empty reports."""
+    # File handling: write a report through a context manager so its file is closed after export.
+    # Always write the header, even when there are no rows, so each report stays usable.
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+def write_browser_report(path: Path, records: list[AttendanceRecord], rejected: list[dict[str, str]],
+                         summaries: list[dict[str, Any]], exceptions: list[dict[str, Any]]) -> None:
+    """Create a self-contained interactive HTML report for the latest run."""
+    # Comprehensions: reshape records and exceptions into simple dictionaries for the browser report.
+    # Match each accepted attendance row to any exception reasons for display in the browser table.
+    exception_by_record = {(row["employee_id"], row["date"]): row["exception"] for row in exceptions}
+    detail_rows = [{
+        "employee_id": row.employee_id,
+        "name": row.name,
+        "date": row.work_date.isoformat(),
+        "department": row.department,
+        "status": row.status,
+        "hours_worked": round(row.hours_worked, 2),
+        "overtime": row.hours_worked > OVERTIME_HOURS_THRESHOLD,
+        "exception": exception_by_record.get((row.employee_id, row.work_date.isoformat()), ""),
+    } for row in records]
+    average_attendance = (sum(row["attendance_percentage"] for row in summaries) / len(summaries)
+                          if summaries else 0.0)
+    # Pass only the data the browser view needs: accepted rows, rejected rows, summaries, and totals.
+    data = {
+        "records": detail_rows,
+        "overtime_threshold": OVERTIME_HOURS_THRESHOLD,
+        "rejected": rejected,
+        "summaries": summaries,
+        "stats": {
+            "employees": len(summaries),
+            "valid": len(records),
+            "rejected": len(rejected),
+            "exceptions": len(exceptions),
+            "average_attendance": round(average_attendance, 2),
+            "total_hours": round(sum(row.hours_worked for row in records), 2),
+        },
+    }
+    # JSON embeds the Python results in the HTML; escaping '<' prevents data ending a script tag.
+    report_data = json.dumps(data, ensure_ascii=False).replace("<", "\\u003c")
+    # Keep the report template beside this script, independent of the caller's working directory.
+    template_path = Path(__file__).resolve().parent / "report.html"
+    template = template_path.read_text(encoding="utf-8")
+    document = template.replace("__REPORT_DATA__", report_data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(document, encoding="utf-8")
+
+
+def write_reports(records: list[AttendanceRecord], rejected: list[dict[str, str]],
+                  summaries: list[dict[str, Any]], exceptions: list[dict[str, Any]],
+                  output_dir: Path, logger: logging.Logger,
+                  generate_browser_report: bool = False) -> None:
+    """Write cleaned data, rejected records, employee summary, and exception report."""
+    # Functional requirement 4: generate the summary report and output files.
+    # Normalize accepted records before exporting, so calculated hours and
+    # dates are included in the cleaned output.
+    # Comprehension: make an output dictionary for each accepted record in the cleaned CSV.
+    cleaned_rows = [{
+        "employee_id": r.employee_id, "name": r.name, "date": r.work_date.isoformat(),
+        "status": r.status, "department": r.department,
+        "login_time": r.login_time.strftime("%H:%M:%S") if r.login_time else "",
+        "logout_time": r.logout_time.strftime("%H:%M:%S") if r.logout_time else "",
+        "hours_worked": round(r.hours_worked, 2),
+    } for r in records]
+    # Keep overtime records in a separate export when the original hours exceed eight.
+    overtime_rows = [row for row, record in zip(cleaned_rows, records)
+                     if record.hours_worked > OVERTIME_HOURS_THRESHOLD]
+    write_csv(output_dir / "cleaned_attendance.csv", cleaned_rows,
+              ["employee_id", "name", "date", "status", "department", "login_time", "logout_time", "hours_worked"])
+    write_csv(output_dir / "overtime_records.csv", overtime_rows,
+              ["employee_id", "name", "date", "status", "department", "login_time", "logout_time", "hours_worked"])
+    write_csv(output_dir / "rejected_records.csv", rejected,
+              ["source_row", "employee_id", "name", "date", "status", "rejection_reasons"])
+    write_csv(output_dir / "employee_summary.csv", summaries,
+              ["employee_id", "name", "department", "records_count", "eligible_days",
+               "attended_day_equivalent", "attendance_percentage", "total_working_hours",
+               "absent_days", "late_days", "half_days"])
+    write_csv(output_dir / "attendance_exceptions.csv", exceptions,
+              ["employee_id", "name", "department", "date", "status", "hours_worked", "exception"])
+
+    # The overall attendance figure is the simple average of employee rates;
+    # total hours are summed across the employee summaries.
+    if summaries:
+        average_attendance = sum(x["attendance_percentage"] for x in summaries) / len(summaries)
+        total_hours = sum(x["total_working_hours"] for x in summaries)
+    else:
+        average_attendance, total_hours = 0.0, 0.0
+    text = [
+        "EMPLOYEE ATTENDANCE & PRODUCTIVITY SUMMARY",
+        "=" * 44,
+        f"Valid attendance records: {len(records)}",
+        f"Rejected records: {len(rejected)}",
+        f"Employees analyzed: {len(summaries)}",
+        f"Attendance exceptions: {len(exceptions)}",
+        f"Overtime records (more than {OVERTIME_HOURS_THRESHOLD:.0f} hours): {len(overtime_rows)}",
+        f"Average employee attendance percentage: {average_attendance:.2f}%",
+        f"Total working hours: {total_hours:.2f}",
+        "",
+        "Attendance percentage uses present + late + half-day credit (0.5), divided by eligible records.",
+        "Approved leave records are excluded from eligible days.",
+        "Low-hours threshold is configurable and defaults to 8 hours.",
+    ]
+    # File handling: save the text summary as UTF-8 in the selected output directory.
+    (output_dir / "summary_report.txt").write_text("\n".join(text) + "\n", encoding="utf-8")
+    # The interactive browser report is optional for direct run() callers and enabled by the CLI.
+    if generate_browser_report:
+        browser_report = output_dir / "attendance_report.html"
+        write_browser_report(browser_report, records, rejected, summaries, exceptions)
+        report_uri = browser_report.resolve().as_uri()
+        logger.info("Browser report generated at %s", browser_report.resolve())
+        # Ask the operating system to open the generated local HTML report in a new browser tab.
+        # Ask the operating system to open the generated local HTML report in a new browser tab.
+        browser_opened = webbrowser.open(report_uri, new=2)
+        if browser_opened:
+            logger.info("Opened the report in your default browser.")
+        else:
+            logger.warning("Could not open a browser automatically. Open this report: %s", report_uri)
+        if sys.stdout.isatty():
+            # OSC 8 makes the label itself clickable in terminals that support hyperlinks.
+            print(f"\x1b]8;;{report_uri}\x1b\\Open attendance report in browser\x1b]8;;\x1b\\")
+            print("Ctrl+click the report link above if a normal click does not open it.")
+        else:
+            print(f"Open attendance report in browser: {report_uri}")
+    logger.info("Wrote reports to %s", output_dir.resolve())
+
+
+def run(input_path: Path, output_dir: Path, low_hours_threshold: float = DEFAULT_LOW_HOURS,
+        generate_browser_report: bool = False) -> int:
+    """Execute the end-to-end pipeline. Return non-zero for input/pipeline failures."""
+    # Connect input, validation, calculations, reports, console summary, and logging into one run.
+    # Logging: create run-specific console and file handlers before processing begins.
+    logger = configure_logging(output_dir)
+    try:
+        # Reject impossible thresholds before reading data so exception checks use a sensible range.
+        if low_hours_threshold < 0 or low_hours_threshold > 24:
+            raise ValueError("low-hours threshold must be between 0 and 24")
+        logger.info("Starting attendance analysis for %s", input_path)
+        # Each stage passes its result to the next: raw rows -> clean rows ->
+        # employee metrics/exceptions -> output files.
+        rows = read_input(input_path)
+        records, rejected = validate_and_clean(rows, logger)
+        summaries, exceptions = calculate_metrics(records, low_hours_threshold)
+        write_reports(records, rejected, summaries, exceptions, output_dir, logger,
+                      generate_browser_report=generate_browser_report)
+        logger.info("Completed: %s valid, %s rejected, %s employees, %s exceptions",
+                    len(records), len(rejected), len(summaries), len(exceptions))
+        return 0
+    except (OSError, ValueError, RuntimeError, csv.Error) as exc:
+        # Convert expected input/output problems into a logged message and a non-zero command result.
+        # Exception handling: log expected file/input failures and return a non-zero status to the CLI.
+        logger.exception("Analysis failed: %s", exc)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        # Release the file handle when the run completes so callers can safely
+        # replace or remove the output directory (notably on Windows).
+        for handler in logger.handlers[:]:
+            logger.removeHandler(handler)
+            handler.close()
+
+
+def main() -> None:
+    # argparse provides --help and lets users select files and thresholds
+    # without editing the source code.
+    parser = argparse.ArgumentParser(description="Analyze employee attendance records.")
+    parser.add_argument("--input", default="data/attendance_sample.csv", help="Input .csv or .xlsx file")
+    parser.add_argument("--output-dir", default="output", help="Directory for generated reports and logs")
+    parser.add_argument("--low-hours-threshold", type=float, default=DEFAULT_LOW_HOURS,
+                        help="Flag attended days below this number of hours (default: 8)")
+    args = parser.parse_args()
+    # The command-line experience also creates and opens the interactive browser report.
+    raise SystemExit(run(Path(args.input), Path(args.output_dir), args.low_hours_threshold,
+                         generate_browser_report=True))
+
+
+if __name__ == "__main__":
+    main()

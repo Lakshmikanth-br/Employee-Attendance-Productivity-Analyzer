@@ -1,0 +1,12 @@
+Verification run: 2026-10-12
+Python: 3.13.15
+
+Command: python -m unittest discover -s tests -v
+Result: PASS (10 tests)
+
+Coverage includes parsing and numeric validation, attendance credit and metrics, invalid/duplicate row handling, rejected rows followed by valid rows, reversed time validation, blank-name rejection, and end-to-end output generation.
+
+Command: python main.py
+Result: PASS (exit code 0)
+The browser report was generated and opened.
+Sample summary: 11 valid rows, 3 rejected rows, 4 employees, 4 exceptions.

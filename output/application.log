@@ -1,0 +1,8 @@
+2026-10-12 22:08:12,207 | INFO | Starting attendance analysis for data/attendance_sample.csv
+2026-10-12 22:08:12,210 | WARNING | Rejected source row 12: date must use YYYY-MM-DD, DD/MM/YYYY, or MM/DD/YYYY
+2026-10-12 22:08:12,210 | WARNING | Rejected duplicate employee/date at source row 13
+2026-10-12 22:08:12,210 | WARNING | Rejected source row 14: name is required
+2026-10-12 22:08:12,339 | INFO | Browser report generated at /Users/lbr/Desktop/Day 6/Employee_Attendance_and_Productivity_Analyzer-main/output/attendance_report.html
+2026-10-12 22:08:12,769 | INFO | Opened the report in your default browser.
+2026-10-12 22:08:12,770 | INFO | Wrote reports to /Users/lbr/Desktop/Day 6/Employee_Attendance_and_Productivity_Analyzer-main/output
+2026-10-12 22:08:12,770 | INFO | Completed: 14 valid, 3 rejected, 7 employees, 4 exceptions
